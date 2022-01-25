@@ -222,7 +222,8 @@ static void tlshd_push_handshake(SSL *ssl, int fd, struct sockaddr *addr)
 	tlshd_log_success(addr);
 }
 
-static void tlshd_initial_handshake(SSL_CTX *ctx, int fd, struct sockaddr *addr)
+static void tlshd_initial_handshake(SSL_CTX *ctx, int fd,
+				    struct sockaddr *addr, bool is_server)
 {
 	BIO *bio;
 	SSL *ssl;
@@ -244,6 +245,11 @@ static void tlshd_initial_handshake(SSL_CTX *ctx, int fd, struct sockaddr *addr)
 		goto out_bio_free;
 	}
 
+	if (is_server)
+		SSL_set_accept_state(ssl);
+	else
+		SSL_set_connect_state(ssl);
+
 	tlshd_push_handshake(ssl, fd, addr);
 
 	SSL_free(ssl);
@@ -257,7 +263,7 @@ out_bio_free:
  * initially negotiated.
  */
 static void tlshd_renegotiate_session_key(SSL_CTX *ctx, int fd,
-					  struct sockaddr *addr)
+					  struct sockaddr *addr, bool is_server)
 {
 	BIO *bio;
 	SSL *ssl;
@@ -277,6 +283,11 @@ static void tlshd_renegotiate_session_key(SSL_CTX *ctx, int fd,
 		tlshd_log_liberrors();
 		goto out_bio_free;
 	}
+	if (is_server)
+		SSL_set_accept_state(ssl);
+	else
+		SSL_set_connect_state(ssl);
+
 	switch (SSL_version(ssl)) {
 	case TLS1_2_VERSION:
 		if (!SSL_renegotiate(ssl)) {
@@ -408,9 +419,11 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 		goto out_ctx_free;
 	}
 	if (strcmp(optval, "tls") == 0)
-		tlshd_renegotiate_session_key(ctx, fd, addr);
+		tlshd_renegotiate_session_key(ctx, fd, addr,
+					      server_mode != 0);
 	else
-		tlshd_initial_handshake(ctx, fd, addr);
+		tlshd_initial_handshake(ctx, fd, addr,
+					server_mode != 0);
 
 out_ctx_free:
 	SSL_CTX_free(ctx);
