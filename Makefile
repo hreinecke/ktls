@@ -9,7 +9,7 @@ CFLAGS = -Wall -g -D_GNU_SOURCE
 all: $(PROGRAMS)
 
 $(KTLSD): $(KTLSD_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(KTLSD_OBJS) -lssl -lcrypto
+	$(CC) $(CFLAGS) -o $@ $(KTLSD_OBJS) -lssl -lcrypto -lkeyutils
 
 $(TLSKEY): $(TLSKEY_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(TLSKEY_OBJS) -lssl -lcrypto -lz -lkeyutils

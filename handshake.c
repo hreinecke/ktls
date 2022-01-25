@@ -13,12 +13,15 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 
 #include <netinet/tcp.h>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+
+#include <keyutils.h>
 
 #include <linux/tls.h>
 
@@ -30,6 +33,18 @@
 
 #ifndef SOL_TLS
 #define SOL_TLS 282
+#endif
+
+#ifndef TLS_KEY
+#define TLS_KEY 4
+#endif
+
+#ifndef TLS_CIPHER
+#define TLS_CIPHER 5
+#endif
+
+#ifndef TLS_SERVER_MODE
+#define TLS_SERVER_MODE 6
 #endif
 
 /*
@@ -45,7 +60,7 @@
 
 char *tlshd_truststore = NULL;
 key_serial_t *tlshd_keylist;
-size_t tlshd_keylist_entries;
+size_t tlshd_keylist_size;
 
 static unsigned int tlshd_psk_client_cb(SSL *ssl, const char *hint,
 					char *identity,
@@ -53,17 +68,23 @@ static unsigned int tlshd_psk_client_cb(SSL *ssl, const char *hint,
 					unsigned char *psk,
 					unsigned int max_psk_len)
 {
-	int ret;
-	long key_len;
-	unsigned char *key;
+	int ret, i;
+	char *psk_identity;
+	key_serial_t tls_key;
 
-	if (hint) {
+	if (hint)
 		syslog(LOG_DEBUG, "Received PSK identity hint '%s'\n", hint);
+
+	psk_identity = malloc(max_identity_len);
+	if (!psk_identity) {
+		errno = ENOMEM;
+		return -1;
+	}
 
 	/*
 	 * lookup PSK identity and PSK key based on the given identity hint here
 	 */
-	for (i = 0; i < tlshd_keylist_num; i++) {
+	for (i = 0; i < tlshd_keylist_size; i++) {
 		ret = keyctl_describe(tlshd_keylist[i], psk_identity,
 				      max_identity_len);
 		if (ret < 0) {
@@ -74,14 +95,18 @@ static unsigned int tlshd_psk_client_cb(SSL *ssl, const char *hint,
 		if (hint && strcmp(psk_identity, hint))
 			continue;
 		tls_key = tlshd_keylist[i];
-		ret = snprintf(identity, max_identity_len, "%s", psk_identity);
+		strncpy(identity, psk_identity, max_identity_len);
 		break;
 	}
-	if (ret < 0 || (unsigned int)ret > max_identity_len)
-		goto out_err;
-        syslog(LOG_DEBUG, "created identity '%s' len=%d\n", identity,
+	if (ret < 0 || (unsigned int)ret > max_identity_len) {
+		syslog(LOG_WARNING, "failed to get TLS identity\n");
+		errno = ENOKEY;
+		return -1;
+	}
+
+        syslog(LOG_DEBUG, "using psk identity '%s' len=%d\n", identity,
 	       ret);
-	ret = keyctl_read(tls_key, psk, max_psk_len);
+	ret = keyctl_read(tls_key, (char *)psk, max_psk_len);
 	if (ret < 0) {
 		syslog(LOG_ERR, "failed to read key");
 	} else {
@@ -233,6 +258,29 @@ out_bio_free:
 	BIO_free_all(bio);
 }
 
+void tlshd_load_psk_list(int fd)
+{
+	socklen_t optlen;
+	unsigned int key_size;
+
+	if (getsockopt(fd, SOL_TLS, TLS_KEY, &key_size, &optlen) < 0) {
+		tlshd_log_perror("getsockopt TLS_KEY");
+		return;
+	}
+	tlshd_keylist = malloc((key_size + 1) * 4);
+	if (!tlshd_keylist) {
+		tlshd_log_perror("malloc keylist");
+		return;
+	}
+	if (getsockopt(fd, SOL_TLS, TLS_KEY, &tlshd_keylist, &optlen) < 0) {
+		tlshd_log_perror("getsockopt keylist");
+		free(tlshd_keylist);
+		tlshd_keylist = NULL;
+		return;
+	}
+	tlshd_keylist_size = key_size;
+}
+
 /**
  * tlshd_service_socket - Service a kernel socket needing a key operation
  * @fd: socket descriptor of kernel socket to service
@@ -246,6 +294,7 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 	const SSL_METHOD *method;
 	socklen_t optlen;
 	char optval[20];
+	unsigned char server_mode;
 	SSL_CTX *ctx;
 
 	switch (addr->sa_family) {
@@ -265,12 +314,10 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 	SSL_library_init();
 	SSL_load_error_strings();
 
-	optlen = sizeof(optval);
-	if (getsockopt(fd, SOL_TLS, TLS_SERVER_MODE, optval, 1)) {
+	optlen = 1;
+	if (getsockopt(fd, SOL_TLS, TLS_SERVER_MODE, &server_mode, &optlen)) {
 		tlshd_log_perror("getsockopt");
-		server_mode = false;
-	} else {
-		server_mode = optval;
+		server_mode = 0;
 	}
 	if (server_mode)
 		method = TLS_server_method();
@@ -293,6 +340,8 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 			goto out_ctx_free;
 		}
 	}
+
+	tlshd_load_psk_list(fd);
 
 	SSL_CTX_set_psk_client_callback(ctx, tlshd_psk_client_cb);
 
@@ -318,4 +367,6 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 
 out_ctx_free:
 	SSL_CTX_free(ctx);
+	if (tlshd_keylist)
+		free(tlshd_keylist);
 }
