@@ -91,17 +91,29 @@ static int tlshd_psk_session_cb(SSL *ssl, const EVP_MD *md,
 	/*
 	 * lookup PSK identity and PSK key
 	 */
-	for (i = 0; i < tlshd_keylist_size; i++) {
+	for (i = 1; i <= tlshd_keylist_size; i++) {
 		unsigned char cipher_buf[2];
 
-		ret = keyctl_read(tlshd_keylist[i], (char *)psk, max_psk_len);
+		ret = keyctl_describe(tlshd_keylist[i], psk_identity,
+				      max_identity_len);
 		if (ret < 0) {
-			syslog(LOG_WARNING,
-			       "failed to read key %d cipher\n", i);
+		    syslog(LOG_INFO, "failed to describe key %08x\n",
+			   tlshd_keylist[i]);
+		    goto out_free_identity;
+		}
+		syslog(LOG_DEBUG, "using psk identity '%s'\n", psk_identity);
+		cipher_buf[0] = 0x13;
+		if (!strncmp(psk_identity, "NVMe0G01", 8) ||
+		    !strncmp(psk_identity, "NVMe0R01", 8)) {
+			cipher_buf[1] = 0x01;
+		} else if (!strncmp(psk_identity, "NVMe0G02", 8) ||
+			   !strncmp(psk_identity, "NVMe0R02", 8)) {
+			cipher_buf[1] = 0x02;
+		} else {
+			syslog(LOG_INFO, "Invalid psk identity '%s'\n",
+			       psk_identity);
 			continue;
 		}
-		psk_len = ret;
-		memcpy(cipher_buf, psk, 2);
 		cipher = SSL_CIPHER_find(ssl, cipher_buf);
 		if (cipher == NULL) {
 			syslog(LOG_INFO, "failed to find cipher %02x %02x\n",
@@ -127,19 +139,18 @@ static int tlshd_psk_session_cb(SSL *ssl, const EVP_MD *md,
 		goto out_free_identity;
 	}
 
-	if (!SSL_SESSION_set1_master_key(psk_sess, psk + 2, psk_len  - 2)) {
+	ret = keyctl_read(tls_key, (char *)psk, max_psk_len);
+	if (ret < 0) {
+		syslog(LOG_WARNING,
+		       "failed to read key %d\n", i);
+		goto out_free_identity;
+	}
+	psk_len = ret;
+	if (!SSL_SESSION_set1_master_key(psk_sess, psk, psk_len)) {
 		syslog(LOG_ERR, "failed to set SSL master key\n");
 		errno = ENOKEY;
 		goto out_free_identity;
 	}
-	ret = keyctl_describe(tls_key, psk_identity,
-			      max_identity_len);
-	if (ret < 0) {
-		syslog(LOG_INFO, "failed to describe key %08x\n",
-		       tls_key);
-		goto out_free_identity;
-	}
-        syslog(LOG_DEBUG, "using psk identity '%s'\n", psk_identity);
 	*id = (unsigned char *)psk_identity;
 	*idlen = strlen(psk_identity);
 	*sess = psk_sess;
