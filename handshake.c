@@ -62,57 +62,93 @@ char *tlshd_truststore = NULL;
 key_serial_t *tlshd_keylist;
 size_t tlshd_keylist_size;
 
-static unsigned int tlshd_psk_client_cb(SSL *ssl, const char *hint,
-					char *identity,
-					unsigned int max_identity_len,
-					unsigned char *psk,
-					unsigned int max_psk_len)
+static int tlshd_psk_session_cb(SSL *ssl, const EVP_MD *md,
+				const unsigned char **id,
+				size_t *idlen,
+				SSL_SESSION **sess)
 {
-	int ret, i;
+	SSL_SESSION *psk_sess = NULL;
+	const SSL_CIPHER *cipher = NULL;
+	int ret, i, psk_len;
+	int max_identity_len = 1024, max_psk_len = 64;
 	char *psk_identity;
+	unsigned char psk[64];
 	key_serial_t tls_key;
 
-	if (hint)
-		syslog(LOG_DEBUG, "Received PSK identity hint '%s'\n", hint);
+	psk_sess = SSL_SESSION_new();
+	if (psk_sess == NULL)
+		return 0;
+
+	if (!SSL_SESSION_set_protocol_version(psk_sess, TLS1_3_VERSION))
+		goto out_free_session;
 
 	psk_identity = malloc(max_identity_len);
 	if (!psk_identity) {
 		errno = ENOMEM;
-		return -1;
+		goto out_free_session;
 	}
 
 	/*
-	 * lookup PSK identity and PSK key based on the given identity hint here
+	 * lookup PSK identity and PSK key
 	 */
 	for (i = 0; i < tlshd_keylist_size; i++) {
-		ret = keyctl_describe(tlshd_keylist[i], psk_identity,
-				      max_identity_len);
+		unsigned char cipher_buf[2];
+
+		ret = keyctl_read(tlshd_keylist[i], (char *)psk, max_psk_len);
 		if (ret < 0) {
-			syslog(LOG_INFO, "failed to describe key %08x\n",
-			       tlshd_keylist[i]);
+			syslog(LOG_WARNING,
+			       "failed to read key %d cipher\n", i);
 			continue;
 		}
-		if (hint && strcmp(psk_identity, hint))
+		psk_len = ret;
+		memcpy(cipher_buf, psk, 2);
+		cipher = SSL_CIPHER_find(ssl, cipher_buf);
+		if (cipher == NULL) {
+			syslog(LOG_INFO, "failed to find cipher %02x %02x\n",
+			       cipher_buf[0], cipher_buf[1]);
 			continue;
+		}
+		if (md != NULL &&
+		    SSL_CIPHER_get_handshake_digest(cipher) != md) {
+			syslog(LOG_INFO, "non-matching cipher, continue\n");
+			continue;
+		}
+		if (!SSL_SESSION_set_cipher(psk_sess, cipher)) {
+			syslog(LOG_INFO, "failed to set cipher %02x %02x\n",
+			       cipher_buf[0], cipher_buf[1]);
+			continue;
+		}
 		tls_key = tlshd_keylist[i];
-		strncpy(identity, psk_identity, max_identity_len);
 		break;
 	}
-	if (ret < 0 || (unsigned int)ret > max_identity_len) {
+	if (!tls_key) {
 		syslog(LOG_WARNING, "failed to get TLS identity\n");
 		errno = ENOKEY;
-		return -1;
+		goto out_free_identity;
 	}
 
-        syslog(LOG_DEBUG, "using psk identity '%s' len=%d\n", identity,
-	       ret);
-	ret = keyctl_read(tls_key, (char *)psk, max_psk_len);
-	if (ret < 0) {
-		syslog(LOG_ERR, "failed to read key");
-	} else {
-		syslog(LOG_DEBUG, "read %d key bytes\n", ret);
+	if (!SSL_SESSION_set1_master_key(psk_sess, psk + 2, psk_len  - 2)) {
+		syslog(LOG_ERR, "failed to set SSL master key\n");
+		errno = ENOKEY;
+		goto out_free_identity;
 	}
-	return ret;
+	ret = keyctl_describe(tls_key, psk_identity,
+			      max_identity_len);
+	if (ret < 0) {
+		syslog(LOG_INFO, "failed to describe key %08x\n",
+		       tls_key);
+		goto out_free_identity;
+	}
+        syslog(LOG_DEBUG, "using psk identity '%s'\n", psk_identity);
+	*id = (unsigned char *)psk_identity;
+	*idlen = strlen(psk_identity);
+	*sess = psk_sess;
+	return 1;
+out_free_identity:
+	free(psk_identity);
+out_free_session:
+	SSL_SESSION_free(psk_sess);
+	return 0;
 }
 
 /*
@@ -343,7 +379,7 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 
 	tlshd_load_psk_list(fd);
 
-	SSL_CTX_set_psk_client_callback(ctx, tlshd_psk_client_cb);
+	SSL_CTX_set_psk_use_session_callback(ctx, tlshd_psk_session_cb);
 
 	if (!SSL_CTX_set_min_proto_version(ctx, TLSD_MIN_TLS_VERSION)) {
 		tlshd_log_liberrors();
