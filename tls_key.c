@@ -306,8 +306,6 @@ static int import_key(const char *keyfile, const char *hostnqn,
 		err = ENOKEY;
 		goto out_free;
 	}
-	printf("NVMe TLS retained key generated (HMAC %d, length %ld)\n",
-	       hmac, key_len);
 
 	/* Derive TLS key */
 	err  = derive_tls_key(md, hostnqn, subsysnqn, retained_key, key_len);
