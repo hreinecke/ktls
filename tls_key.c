@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include <getopt.h>
 
@@ -14,6 +15,54 @@
 #include <openssl/kdf.h>
 #include <zlib.h>
 #include <keyutils.h>
+
+static int add_to_keyring(const char *key_ring, const char *key_type,
+			  char *identity, unsigned char *key_data, size_t key_len)
+{
+	key_serial_t user_keyring_id, keyring_id;
+	key_serial_t key;
+	int err, ret;
+
+	user_keyring_id = keyctl_get_keyring_ID(KEY_SPEC_USER_KEYRING, false);
+	if (user_keyring_id < 0) {
+		fprintf(stderr, "@u keyring not available, error %d\n", errno);
+		return ENODEV;
+	}
+	printf("adding %s key '%s'\n", key_type, identity);
+	key = add_key(key_type, identity, key_data, key_len, user_keyring_id);
+	if (key < 0) {
+		fprintf(stderr, "adding %s key '%s' to user keyring failed, error %d\n",
+			key_type, identity, errno);
+		return ENOKEY;
+	}
+	err = keyctl_setperm(key, KEY_POS_ALL | (KEY_USR_ALL & ~KEY_USR_SETATTR));
+	if (err) {
+		fprintf(stderr, "setperm %s key '%s' failed, error %d\n",
+			key_type, identity, errno);
+		ret = errno;
+		goto out_revoke;
+	}
+
+	keyring_id = find_key_by_type_and_desc("keyring", key_ring, 0);
+	if (keyring_id < 0) {
+		fprintf(stderr, "'%s' keyring not found, purging key\n", key_ring);
+		ret = ENXIO;
+		goto out_revoke;
+	}
+	err = keyctl_link(key, keyring_id);
+	if (err) {
+		fprintf(stderr, "link %s key to .nvme keyring failed, error %d\n",
+			key_type, errno);
+		ret = errno;
+		goto out_revoke;
+	}
+	err = keyctl_unlink(key, user_keyring_id);
+	if (!err)
+		return 0;
+out_revoke:
+	keyctl_revoke(key);
+	return ret;
+}
 
 static int derive_tls_key(const EVP_MD *md,
 			  const char *hostnqn, const char *subsysnqn,
@@ -23,7 +72,6 @@ static int derive_tls_key(const EVP_MD *md,
 	char *psk_identity;
 	unsigned char *psk;
 	size_t psk_len;
-	key_serial_t keyring_id;
 	int err, i;
 
 	psk_identity = malloc(strlen(hostnqn) + strlen(subsysnqn) + 12);
@@ -65,35 +113,14 @@ static int derive_tls_key(const EVP_MD *md,
 		fprintf(stderr, "EVP_KDF_derive failed\n");
 	}
 
-	keyring_id = find_key_by_type_and_desc("keyring", ".tls", 0);
-	if (keyring_id < 0) {
+	err = add_to_keyring(".tls", "tls", psk_identity, psk, psk_len);
+	if (err) {
 		printf("TLS keyring not available\ngenerated TLS key\n%s\n",
 		       psk_identity);
 		for (i = 0; i < psk_len; i++)
 			printf("%02x", psk[i]);
 		printf("\n");
-	} else {
-		key_serial_t key;
-		const char *key_type = "tls";
-
-		key = keyctl_search(keyring_id, key_type, psk_identity, 0);
-		if (key >= 0) {
-			printf("updating %s key '%s'\n",
-			       key_type, psk_identity);
-			err = keyctl_update(key, psk, psk_len);
-			if (err)
-				fprintf(stderr, "updatint %s key '%s' failed\n",
-					key_type, psk_identity);
-		} else {
-			printf("adding %s key '%s'\n", key_type, psk_identity);
-			key = add_key(key_type, psk_identity,
-				      psk, psk_len, keyring_id);
-			if (key < 0)
-				fprintf(stderr, "adding %s key '%s' failed, error %d\n",
-					key_type, psk_identity, errno);
-		}
 	}
-	err = 0;
 
 out_free_ctx:
 	EVP_PKEY_CTX_free(ctx);	
@@ -112,12 +139,21 @@ static unsigned char *derive_retained_key(const EVP_MD *md, const char *hostnqn,
 	unsigned char *retained_key;
 	EVP_PKEY_CTX *ctx;
 	size_t retained_len;
-	key_serial_t keyring_id;
-	int err;
+	char *identity;
+	int err, i;
+
+	identity = malloc(strlen(hostnqn) + 4);
+	if (!identity)
+		return NULL;
+
+	sprintf(identity, "%02d %s",
+		md == EVP_sha256() ? 1 : 2, hostnqn);
 
 	retained_key = malloc(key_len);
-	if (!retained_key)
-		return NULL;
+	if (!retained_key) {
+		err = ENOMEM;
+		goto out_free_identity;
+	}
 
 	retained_len = key_len;
 	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
@@ -126,62 +162,42 @@ static unsigned char *derive_retained_key(const EVP_MD *md, const char *hostnqn,
 
 	err = -ENOKEY;
 	if (EVP_PKEY_derive_init(ctx) <= 0)
-		goto out_free_retained_key;
+		goto out_free_ctx;
 	if (EVP_PKEY_CTX_set_hkdf_md(ctx, md) <= 0)
-		goto out_free_retained_key;
+		goto out_free_ctx;
 	if (EVP_PKEY_CTX_set1_hkdf_key(ctx, generated_key, key_len) <= 0)
-		goto out_free_retained_key;
+		goto out_free_ctx;
 	if (EVP_PKEY_CTX_add1_hkdf_info(ctx, "tls13 ", 6) <= 0)
-		goto out_free_retained_key;
+		goto out_free_ctx;
 	if (EVP_PKEY_CTX_add1_hkdf_info(ctx, "HostNQN", 7) <= 0)
-		goto out_free_retained_key;
+		goto out_free_ctx;
 	if (EVP_PKEY_CTX_add1_hkdf_info(ctx, hostnqn, strlen(hostnqn)) <= 0)
-		goto out_free_retained_key;
+		goto out_free_ctx;
 
 	if (EVP_PKEY_derive(ctx, retained_key, &retained_len) <= 0) {
 		fprintf(stderr, "EVP_KDF derive failed\n");
 		err = ENOKEY;
+		goto out_free_ctx;
 	}
-	err = 0;
 
-	keyring_id = find_key_by_type_and_desc("keyring", ".nvme", 0);
-	if (keyring_id < 0) {
-		fprintf(stderr, "NVMe keyring not available, error %d", errno);
-	} else {
-		key_serial_t key;
-		const char *key_type = "psk";
-		char *identity;
-
-		identity = malloc(strlen(hostnqn) + 4);
-		if (!identity) {
-			err = ENOMEM;
-			goto out_free_retained_key;
-		}
-		sprintf(identity, "%02d %s",
-			md == EVP_sha256() ? 1 : 2, hostnqn);
-		key = keyctl_search(keyring_id, key_type, identity, 0);
-		if (key >= 0) {
-			printf("updating %s key '%s'\n", key_type, identity);
-			err = keyctl_update(key, retained_key, retained_len);
-			if (err)
-				fprintf(stderr, "updating %s key '%s' failed\n",
-					key_type, identity);
-		} else {
-			printf("adding %s key '%s'\n", key_type, identity);
-			key = add_key(key_type, identity,
-				      retained_key, retained_len, keyring_id);
-			if (key < 0)
-				fprintf(stderr, "adding %s key '%s' failed, error %d\n",
-					key_type, identity, errno);
-		}
-		free(identity);
+	err = add_to_keyring(".nvme", "psk", identity, retained_key, retained_len);
+	if (err) {
+		fprintf(stderr, ".nvme keyring not available, error %d\n", err);
+		printf("generated NVMe PSK\n%s\n", identity);
+		for (i = 0; i < retained_len; i++)
+			printf("%02x", retained_key[i]);
+		printf("\n");
 	}
+
+out_free_ctx:
+	EVP_PKEY_CTX_free(ctx);
 out_free_retained_key:
 	if (err) {
 		free(retained_key);
 		retained_key = NULL;
 	}
-	EVP_PKEY_CTX_free(ctx);
+out_free_identity:
+	free(identity);
 	return retained_key;
 }
 
