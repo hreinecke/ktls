@@ -78,7 +78,7 @@ static int derive_tls_key(const EVP_MD *md,
 	if (!psk_identity)
 		return ENOMEM;
 
-	sprintf(psk_identity, "NVMeR%02d %s %s", md == EVP_sha256() ? 1 : 2,
+	sprintf(psk_identity, "NVMe0R%02d %s %s", md == EVP_sha256() ? 1 : 2,
 		hostnqn, subsysnqn);
 
 	psk = malloc(key_len);
