@@ -128,7 +128,7 @@ int ktls_set_tls_mode(struct ktls_session *session, const char *mode)
 	else if (!strcmp("tls_12_256_gcm", mode))
 		session->tls_mode = KTLS_TLS_12_256_GCM;
 	else {
-		fprintf(stderr, "unknown tls mode: %s", mode);
+		fprintf(stderr, "unknown tls mode: %s\n", mode);
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
@@ -157,7 +157,7 @@ int ktls_set_tls_mode(struct ktls_session *session, const char *mode)
 		       TLS_CIPHER_AES_GCM_##X##_SALT_SIZE);		\
 		if (setsockopt(sock, SOL_TLS, is_sender ? TLS_TX : TLS_RX, \
 			       &crypto_info, sizeof(crypto_info))) {	\
-			fprintf(stderr, "fail to set kernel tls: %s",	\
+			fprintf(stderr, "fail to set kernel tls: %s\n",	\
 				strerror(errno));			\
 			goto cleanup;					\
 		}							\
@@ -187,7 +187,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 		rc = gnutls_credentials_set(session->session, GNUTLS_CRD_PSK,
 					    session->psk_cred_client);
 		if (rc != GNUTLS_E_SUCCESS) {
-			fprintf(stderr, "fail to set PSK for client: %s",
+			fprintf(stderr, "fail to set PSK for client: %s\n",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
@@ -197,7 +197,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 		rc = gnutls_credentials_set(session->session, GNUTLS_CRD_PSK,
 					    session->psk_cred_server);
 		if (rc != GNUTLS_E_SUCCESS) {
-			fprintf(stderr, "fail to set PSK for server: %s",
+			fprintf(stderr, "fail to set PSK for server: %s\n",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
@@ -209,14 +209,15 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 					    session->crt_cred);
 
 		if (rc == GNUTLS_E_SUCCESS) {
-			fprintf(stderr, "fail to set certificate: %s",
+			fprintf(stderr, "fail to set certificate: %s\n",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
 	}
 
 	if (setsockopt(sock, SOL_TCP, TCP_ULP, "tls", sizeof("tls"))) {
-		fprintf(stderr, "fail to set kernel TLS on socket: %s", strerror(errno));
+		fprintf(stderr, "fail to set kernel TLS on socket: %s\n",
+			strerror(errno));
 		goto cleanup;
 	}
 
@@ -240,7 +241,8 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 	rc = gnutls_priority_set_direct(session->session, tls_priority_list,
 					NULL);
 	if (rc != GNUTLS_E_SUCCESS) {
-		fprintf(stderr, "fail to set priority: %s", gnutls_strerror(rc));
+		fprintf(stderr, "fail to set priority: %s\n",
+			gnutls_strerror(rc));
 		goto cleanup;
 	}
 
@@ -251,7 +253,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 
 	do {
 		if (handshake_retry < 0) {
-			fprintf(stderr, "exhaust retries on handshake");
+			fprintf(stderr, "exhaust retries on handshake\n");
 			break;
 		}
 		rc = gnutls_handshake(session->session);
@@ -259,7 +261,8 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 	} while (rc < 0 && !gnutls_error_is_fatal(rc));
 
 	if (gnutls_error_is_fatal(rc)) {
-		fprintf(stderr, "fail on handshake: %s", gnutls_strerror(rc));
+		fprintf(stderr, "fail on handshake: %s\n",
+			gnutls_strerror(rc));
 		goto cleanup;
 	}
 	if (ktls_verbose > 0) {
@@ -274,7 +277,8 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 	rc = gnutls_record_get_state(session->session, is_sender ? 0 : 1,
 				     &mac_key, &iv, &cipher_key, seq_number);
 	if (rc != GNUTLS_E_SUCCESS) {
-		fprintf(stderr, "fail on retrieve TLS record: %s", gnutls_strerror(rc));
+		fprintf(stderr, "fail on retrieve TLS record: %s\n",
+			gnutls_strerror(rc));
 		goto cleanup;
 	}
 
@@ -416,7 +420,7 @@ int ktls_set_psk_session(struct ktls_session *session)
 		rc = gnutls_psk_allocate_server_credentials(
 			&session->psk_cred_server);
 		if (rc != GNUTLS_E_SUCCESS) {
-			fprintf(stderr, "fail on set psk for server: %s",
+			fprintf(stderr, "fail on set psk for server: %s\n",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
@@ -428,7 +432,7 @@ int ktls_set_psk_session(struct ktls_session *session)
 		rc = gnutls_psk_allocate_client_credentials(
 			&session->psk_cred_client);
 		if (rc != GNUTLS_E_SUCCESS) {
-			fprintf(stderr, "fail on set psk for client: %s",
+			fprintf(stderr, "fail on set psk for client: %s\n",
 				gnutls_strerror(rc));
 			goto cleanup;
 		}
