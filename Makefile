@@ -17,7 +17,7 @@ $(TLSKEY): $(TLSKEY_OBJS)
 	$(CC) $(CFLAGS) -o $@ $(TLSKEY_OBJS) -lssl -lcrypto -lz -lkeyutils
 
 $(KTLSNL): $(KTLSNL_OBJS)
-	$(CC) $(CFLAGS) -o $@ $(KTLSNL_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(KTLSNL_OBJS) -lkeyutils
 
 %.o: %.c tlshd.h
 	$(CC) $(CFLAGS) -c -o $@ $<

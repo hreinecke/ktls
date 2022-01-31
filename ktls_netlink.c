@@ -30,6 +30,8 @@
 #include <sys/user.h>
 #include <linux/netlink.h>
 
+#include <keyutils.h>
+
 #define NETLINK_TLS 24
 
 #define TLS_NL_MAGIC 0x544C
@@ -106,7 +108,7 @@ int main(int argc, char *argv[])
 		}
 
 		if (tls_msg->magic != TLS_NL_MAGIC) {
-			fprintf(stderr, "Invalid SCSI Netlink magic %d\n",
+			fprintf(stderr, "Invalid TLS Netlink magic %d\n",
 				tls_msg->magic);
 			continue;
 		}
@@ -114,8 +116,20 @@ int main(int argc, char *argv[])
 		fprintf(stdout, "fd: %d\n", tls_msg->fd);
 		fprintf(stdout, "number of keys: %d\n", tls_msg->key_num);
 		for (i = 0; i < tls_msg->key_num; i++) {
+			int err;
+			char *key_id;
+
 			fprintf(stdout, "key serial %d: %08x\n",
 				i, tls_msg->key_serial[i]);
+			err = keyctl_describe_alloc(tls_msg->key_serial[i],
+						    &key_id);
+			if (err < 0) {
+				fprintf(stderr, "Invalid key serial %08x\n",
+					tls_msg->key_serial[i]);
+				continue;
+			}
+			fprintf(stdout, "Key identity: %s\n", key_id);
+			free(key_id);
 		}
 	}
 
