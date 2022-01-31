@@ -97,11 +97,11 @@ static int tlshd_psk_session_cb(SSL *ssl, const EVP_MD *md,
 		ret = keyctl_describe(tlshd_keylist[i], psk_identity,
 				      max_identity_len);
 		if (ret < 0) {
-		    syslog(LOG_INFO, "failed to describe key %08x\n",
-			   tlshd_keylist[i]);
-		    goto out_free_identity;
+			fprintf(stderr, "failed to describe key %08x\n",
+			       tlshd_keylist[i]);
+			goto out_free_identity;
 		}
-		syslog(LOG_DEBUG, "using psk identity '%s'\n", psk_identity);
+		fprintf(stderr, "using psk identity '%s'\n", psk_identity);
 		cipher_buf[0] = 0x13;
 		if (!strncmp(psk_identity, "NVMe0G01", 8) ||
 		    !strncmp(psk_identity, "NVMe0R01", 8)) {
@@ -110,23 +110,23 @@ static int tlshd_psk_session_cb(SSL *ssl, const EVP_MD *md,
 			   !strncmp(psk_identity, "NVMe0R02", 8)) {
 			cipher_buf[1] = 0x02;
 		} else {
-			syslog(LOG_INFO, "Invalid psk identity '%s'\n",
-			       psk_identity);
+			fprintf(stderr, "Invalid psk identity '%s'\n",
+				psk_identity);
 			continue;
 		}
 		cipher = SSL_CIPHER_find(ssl, cipher_buf);
 		if (cipher == NULL) {
-			syslog(LOG_INFO, "failed to find cipher %02x %02x\n",
+			fprintf(stderr, "failed to find cipher %02x %02x\n",
 			       cipher_buf[0], cipher_buf[1]);
 			continue;
 		}
 		if (md != NULL &&
 		    SSL_CIPHER_get_handshake_digest(cipher) != md) {
-			syslog(LOG_INFO, "non-matching cipher, continue\n");
+			fprintf(stderr, "non-matching cipher, continue\n");
 			continue;
 		}
 		if (!SSL_SESSION_set_cipher(psk_sess, cipher)) {
-			syslog(LOG_INFO, "failed to set cipher %02x %02x\n",
+			fprintf(stderr, "failed to set cipher %02x %02x\n",
 			       cipher_buf[0], cipher_buf[1]);
 			continue;
 		}
@@ -134,20 +134,19 @@ static int tlshd_psk_session_cb(SSL *ssl, const EVP_MD *md,
 		break;
 	}
 	if (!tls_key) {
-		syslog(LOG_WARNING, "failed to get TLS identity\n");
+		fprintf(stderr, "failed to get TLS identity\n");
 		errno = ENOKEY;
 		goto out_free_identity;
 	}
 
 	ret = keyctl_read(tls_key, (char *)psk, max_psk_len);
 	if (ret < 0) {
-		syslog(LOG_WARNING,
-		       "failed to read key %d\n", i);
+		fprintf(stderr, "failed to read key %d\n", i);
 		goto out_free_identity;
 	}
 	psk_len = ret;
 	if (!SSL_SESSION_set1_master_key(psk_sess, psk, psk_len)) {
-		syslog(LOG_ERR, "failed to set SSL master key\n");
+		fprintf(stderr, "failed to set SSL master key\n");
 		errno = ENOKEY;
 		goto out_free_identity;
 	}
@@ -170,6 +169,7 @@ static void tlshd_handshake_complete(int fd, int status)
 {
 	char buf[10];
 
+	fprintf(stdout, "TLS handshake complete\n");
 	if (snprintf(buf, sizeof(buf), "%d", status) < 0) {
 		tlshd_log_perror("snprintf");
 		return;
@@ -321,17 +321,18 @@ void tlshd_load_psk_list(int fd)
 	socklen_t optlen;
 	unsigned int key_size;
 
+	fprintf(stdout, "Loading PSK list\n");
 	if (getsockopt(fd, SOL_TLS, TLS_KEY, &key_size, &optlen) < 0) {
-		tlshd_log_perror("getsockopt TLS_KEY");
+		perror("getsockopt TLS_KEY");
 		return;
 	}
 	tlshd_keylist = malloc((key_size + 1) * 4);
 	if (!tlshd_keylist) {
-		tlshd_log_perror("malloc keylist");
+		perror("malloc keylist");
 		return;
 	}
 	if (getsockopt(fd, SOL_TLS, TLS_KEY, &tlshd_keylist, &optlen) < 0) {
-		tlshd_log_perror("getsockopt keylist");
+		perror("getsockopt keylist");
 		free(tlshd_keylist);
 		tlshd_keylist = NULL;
 		return;
@@ -355,6 +356,7 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 	unsigned char server_mode;
 	SSL_CTX *ctx;
 
+	fprintf(stdout, "Service TLS socket\n");
 	switch (addr->sa_family) {
 	case AF_INET:
 		tlshd_log_start(addr);
@@ -374,27 +376,30 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 
 	optlen = 1;
 	if (getsockopt(fd, SOL_TLS, TLS_SERVER_MODE, &server_mode, &optlen)) {
-		tlshd_log_perror("getsockopt");
+		perror("getsockopt");
 		server_mode = 0;
 	}
-	if (server_mode)
+	if (server_mode) {
+		fprintf(stdout, "Running in server mode\n");
 		method = TLS_server_method();
-	else
+	} else {
+		fprintf(stdout, "Running in client mode\n");
 		method = TLS_client_method();
+	}
 	if (!method) {
-		tlshd_log_liberrors();
+		fprintf(stderr, "Invalid mode!\n");
 		return;
 	}
 
 	ctx = SSL_CTX_new(method);
 	if (!ctx) {
-		tlshd_log_liberrors();
+		fprintf(stderr, "Failed to create SSL ctx\n");
 		return;
 	}
 
 	if (tlshd_truststore) {
 		if (!SSL_CTX_load_verify_locations(ctx, tlshd_truststore, NULL)) {
-			tlshd_log_liberrors();
+			fprintf(stderr, "Failed to load truststore\n");
 			goto out_ctx_free;
 		}
 	}
@@ -404,26 +409,24 @@ void tlshd_service_socket(int fd, struct sockaddr *addr, socklen_t addrlen)
 	SSL_CTX_set_psk_use_session_callback(ctx, tlshd_psk_session_cb);
 
 	if (!SSL_CTX_set_min_proto_version(ctx, TLSD_MIN_TLS_VERSION)) {
-		tlshd_log_liberrors();
+		fprintf(stderr, "Failed to set TLS version\n");
 		goto out_ctx_free;
 	}
 
-	/*
-	 * If TLS_ULP is already set to "tls", we've serviced this socket
-	 * before and have already performed an initial handshake. Key
-	 * renegotiation is needed instead of a handshake.
-	 */
-	optlen = sizeof(optval);
-	if (!getsockopt(fd, SOL_TCP, TCP_ULP, optval, &optlen)) {
-		tlshd_log_perror("getsockopt");
+	optlen = 1;
+	if (!getsockopt(fd, SOL_TLS, TLS_DONE, optval, &optlen)) {
+		perror("getsockopt TLS_DONE");
 		goto out_ctx_free;
 	}
-	if (strcmp(optval, "tls") == 0)
+	if (*optval) {
+		fprintf(stdout, "Renegotiate TLS session\n");
 		tlshd_renegotiate_session_key(ctx, fd, addr,
 					      server_mode != 0);
-	else
+	} else {
+		fprintf(stdout, "Start initial TLS handshake\n");
 		tlshd_initial_handshake(ctx, fd, addr,
 					server_mode != 0);
+	}
 
 out_ctx_free:
 	SSL_CTX_free(ctx);

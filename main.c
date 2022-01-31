@@ -29,9 +29,8 @@
 
 #define TLSH_LISTENER_BACKLOG	(20)
 
-static const char *optstring = "dhT:";
+static const char *optstring = "hT:";
 static const struct option longopts[] = {
-	{ "debug",		no_argument,		0, 'd' },
 	{ "help",		no_argument,		0, 'h' },
 	{ "trust-store",	required_argument,	0, 'T' },
 	{ NULL,			0,			0, 0 }
@@ -48,6 +47,7 @@ static void tlshd_parse_poll_result(struct pollfd *fds, nfds_t nfds)
 		if (!(fds[i].revents & POLLIN))
 			continue;
 
+		fprintf(stdout, "POLLIN on socket %d\n", i);
 		fd = accept(fds[i].fd, &addr, &addrlen);
 		if (fd == -1) {
 			/*
@@ -58,7 +58,7 @@ static void tlshd_parse_poll_result(struct pollfd *fds, nfds_t nfds)
 			tlshd_log_perror("accept");
 			continue;
 		}
-
+		fprintf(stdout, "Accept socket %d, start TLS negotiation\n", i);
 		pid = fork();
 		if (!pid) {
 			tlshd_service_socket(fd, &addr, addrlen);
@@ -78,17 +78,12 @@ int main(int argc, char **argv)
 	} u;
 	struct pollfd fds[2];
 	char *progname;
-	bool debug;
 	int c, i;
 
-	debug = false;
 	tlshd_truststore = NULL;
 	progname = basename(argv[0]);
 	while ((c = getopt_long(argc, argv, optstring, longopts, NULL)) != -1) {
 		switch (c) {
-		case 'd':
-			debug = true;
-			break;
 		case 'T':
 			tlshd_truststore = optarg;
 			break;
@@ -98,39 +93,37 @@ int main(int argc, char **argv)
 		}
 	}
 
-	tlshd_log_init(progname, debug);
-
 	fds[0].fd = socket(AF_TLSH, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
 	if (fds[0].fd == -1) {
-		tlshd_log_perror("socket");
+		perror("socket");
 		return EXIT_FAILURE;
 	}
 
 	fds[1].fd = socket(AF_TLSH, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
 	if (fds[1].fd == -1) {
-		tlshd_log_perror("socket");
+		perror("socket");
 		goto out_close0;
 	}
 
 	u.sin.sin_family = AF_INET;
 	u.sin.sin_addr.s_addr = INADDR_ANY;
 	if (bind(fds[0].fd, &u.sa, sizeof(u.sin))) {
-		tlshd_log_perror("bind");
+		perror("bind");
 		goto out_close1;
 	}
 	if (listen(fds[0].fd, TLSH_LISTENER_BACKLOG)) {
-		tlshd_log_perror("listen");
+		perror("listen");
 		goto out_close1;
 	}
 
 	u.sin6.sin6_family = AF_INET6;
 	u.sin6.sin6_addr = in6addr_any;
 	if (bind(fds[1].fd, &u.sa, sizeof(u.sin6))) {
-		tlshd_log_perror("bind");
+		perror("bind");
 		goto out_close1;
 	}
 	if (listen(fds[1].fd, TLSH_LISTENER_BACKLOG)) {
-		tlshd_log_perror("listen");
+		perror("listen");
 		goto out_close1;
 	}
 
@@ -139,8 +132,8 @@ int main(int argc, char **argv)
 			fds[i].events = POLLIN;
 			fds[i].revents = 0;
 		}
-		if (poll(fds, ARRAY_SIZE(fds), -1)) {
-			tlshd_log_perror("poll");
+		if (poll(fds, ARRAY_SIZE(fds), -1) == -1) {
+			perror("poll");
 			goto out_close1;
 		}
 		tlshd_parse_poll_result(fds, ARRAY_SIZE(fds));
