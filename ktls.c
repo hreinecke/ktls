@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -33,9 +34,11 @@
 
 #include <gnutls/gnutls.h>
 
-#include <common/utils.h>
+#include <keyutils.h>
 
 #include "ktls.h"
+
+int ktls_client_key_num;
 
 enum { KTLS_MAX_PASSWORD_LENGTH = 256, KTLS_MAX_PRIORITY_STRING_LENTH = 256 };
 
@@ -62,111 +65,10 @@ struct ktls_session {
 	enum ktls_tls_mode_t tls_mode;
 };
 
-static gnutls_datum_t ktls_psk_username = { 0 };
-static gnutls_datum_t ktls_psk_key = { 0 };
-
 static void ktls_print_logs(int level, const char *msg)
 {
-	if (bconf.verbose >= level)
+	if (ktls_verbose >= level)
 		printf("GnuTLS [%d]: %s", level, msg);
-}
-
-int ktls_set_psk_session_from_password_prompt(struct ktls_session *session,
-					      const char *username)
-{
-	struct termios orig_term_flags, passwd_term_flags;
-	char passwd[KTLS_MAX_PASSWORD_LENGTH];
-	int passwd_sz = 0;
-	int stdin_fd = 0;
-
-	passwd[0] = '\0';
-
-	stdin_fd = fileno(stdin);
-
-	if (!isatty(stdin_fd)) {
-		error("tty needed for password input");
-		return EXIT_FAILURE;
-	}
-
-	tcgetattr(stdin_fd, &orig_term_flags);
-	passwd_term_flags = orig_term_flags;
-	passwd_term_flags.c_lflag &= ~ECHO;
-	passwd_term_flags.c_lflag |= ECHONL;
-
-	if (tcsetattr(stdin_fd, TCSANOW, &passwd_term_flags)) {
-		error("fail to hide password: %s", strerror(errno));
-		return EXIT_FAILURE;
-	}
-
-	printf("password: ");
-	if (!fgets(passwd, sizeof(passwd), stdin)) {
-		error("no password read");
-		return EXIT_FAILURE;
-	}
-
-	if (tcsetattr(fileno(stdin), TCSANOW, &orig_term_flags)) {
-		error("fail to reset tty: %s", strerror(errno));
-		return EXIT_FAILURE;
-	}
-
-	passwd_sz = strlen(passwd);
-	if (passwd_sz <= 0) {
-		error("no password read");
-		return EXIT_FAILURE;
-	}
-	if (passwd[passwd_sz - 1] == '\n') {
-		passwd[passwd_sz - 1] = '\0';
-		passwd_sz--;
-	}
-
-	return ktls_set_psk_session(session, username,
-				    (const unsigned char *)passwd, passwd_sz);
-}
-
-int ktls_set_psk_session_from_keyfile(struct ktls_session *session,
-				      const char *username,
-				      const char *key_file)
-{
-	int rc = GNUTLS_E_SUCCESS;
-	struct stat file_stat;
-	size_t sz = 0;
-	FILE *fp = NULL;
-	gnutls_datum_t input = { NULL, 0UL };
-	gnutls_datum_t output = { NULL, 0UL };
-
-	if (stat(key_file, &file_stat)) {
-		error("fail to open keyfile: %s", strerror(errno));
-		goto cleanup;
-	}
-
-	fp = fopen(key_file, "r");
-	if (!fp) {
-		error("fail to open keyfile: %s", strerror(errno));
-		goto cleanup;
-	}
-
-	input.size = file_stat.st_size;
-
-	input.data = gnutls_malloc(input.size);
-
-	sz = fread(input.data, 1, input.size, fp);
-
-	if (sz != input.size) {
-		error("fail to read PEM");
-		goto cleanup;
-	}
-
-	rc = gnutls_pem_base64_decode2(NULL, &input, &output);
-	if (rc != GNUTLS_E_SUCCESS) {
-		error("Error! fail to decode PEM: %s", gnutls_strerror(rc));
-		goto cleanup;
-	}
-
-	return ktls_set_psk_session(session, username, output.data,
-				    output.size);
-
-cleanup:
-	return EXIT_FAILURE;
 }
 
 struct ktls_session *ktls_create_session(bool is_sender)
@@ -183,7 +85,7 @@ struct ktls_session *ktls_create_session(bool is_sender)
 
 	gnutls_init(&session->session, session->role);
 
-	gnutls_global_set_log_level(bconf.verbose);
+	gnutls_global_set_log_level(ktls_verbose);
 	gnutls_global_set_log_function(ktls_print_logs);
 
 	return session;
@@ -214,134 +116,6 @@ void ktls_destroy_session(struct ktls_session *session)
 	explicit_bzero(session, sizeof(*session));
 }
 
-static int ktls_connect_or_bind(int *sock, bool is_sender, int protocol,
-				struct sockaddr *serv_addr, size_t serv_addr_sz)
-{
-	*sock = 0;
-
-	*sock = socket(protocol, SOCK_STREAM, 0);
-	if (*sock == KTLS_INVALID_FD) {
-		error("could not create socket: %s", strerror(errno));
-		goto cleanup;
-	}
-
-	if (is_sender) {
-		if (connect(*sock, serv_addr, serv_addr_sz)) {
-			error("fail to connect to server: %s", strerror(errno));
-			goto cleanup;
-		}
-		return EXIT_SUCCESS;
-	}
-
-	if (setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 },
-		       sizeof(int))) {
-		error("fail to connect to server: %s", strerror(errno));
-		goto cleanup;
-	}
-
-	if (bind(*sock, serv_addr, serv_addr_sz) || listen(*sock, 1)) {
-		error("fail to serve as server: %s", strerror(errno));
-		goto cleanup;
-	}
-
-	return EXIT_SUCCESS;
-
-cleanup:
-	if (*sock >= 0)
-		close(*sock);
-	return EXIT_FAILURE;
-}
-
-static int ktls_connect_domain(int *sock, bool is_sender, const char *host,
-			       const uint16_t port)
-{
-	struct addrinfo hints = { 0 }, *res = NULL;
-	int rc = 0;
-	struct sockaddr_in addr4;
-	struct sockaddr_in6 addr6;
-
-	memset(&hints, 0, sizeof(hints));
-
-	hints.ai_family = PF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags |= AI_CANONNAME;
-
-	if (getaddrinfo(host, NULL, &hints, &res)) {
-		error("fail to get address info: %s", strerror(errno));
-		return EXIT_FAILURE;
-	}
-
-	while (res) {
-		switch (res->ai_family) {
-		case AF_INET:
-			explicit_bzero(&addr4, sizeof(addr4));
-			addr4.sin_addr =
-				((struct sockaddr_in *)res->ai_addr)->sin_addr;
-			addr4.sin_port = port;
-			addr4.sin_family = res->ai_family;
-			if (!ktls_connect_or_bind(
-				    sock, is_sender, res->ai_family,
-				    (struct sockaddr *)&addr4, sizeof(addr4))) {
-				goto cleanup;
-			}
-			break;
-		case AF_INET6:
-			explicit_bzero(&addr6, sizeof(addr6));
-			addr6.sin6_addr =
-				((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
-			addr6.sin6_port = port;
-			addr6.sin6_family = res->ai_family;
-			if (!ktls_connect_or_bind(
-				    sock, is_sender, res->ai_family,
-				    (struct sockaddr *)&addr6, sizeof(addr6))) {
-				goto cleanup;
-			}
-			break;
-		}
-		res = res->ai_next;
-	}
-
-	freeaddrinfo(res);
-	return EXIT_FAILURE;
-
-cleanup:
-	freeaddrinfo(res);
-	return rc;
-}
-
-static int ktls_connect_ip(int *sock, bool is_sender, const char *host,
-			   const uint16_t port)
-{
-	struct sockaddr_in addr4;
-	struct sockaddr_in6 addr6;
-	struct sockaddr *serv_addr = NULL;
-	size_t serv_addr_sz = 0;
-	sa_family_t protol = AF_INET;
-
-	explicit_bzero(&addr4, sizeof(addr4));
-	explicit_bzero(&addr6, sizeof(addr6));
-
-	if (inet_pton(AF_INET, host, &addr4.sin_addr) == 1) {
-		serv_addr = (struct sockaddr *)&addr4;
-		serv_addr_sz = sizeof(addr4);
-		protol = addr4.sin_family = AF_INET;
-		addr4.sin_port = port;
-	}
-
-	if (!serv_addr && inet_pton(AF_INET6, host, &addr6.sin6_addr) == 1) {
-		serv_addr = (struct sockaddr *)&addr6;
-		serv_addr_sz = sizeof(addr6);
-		protol = addr6.sin6_family = AF_INET6;
-		addr6.sin6_port = port;
-	}
-
-	if (!serv_addr)
-		return KTLS_INVALID_FD;
-
-	return ktls_connect_or_bind(sock, is_sender, protol, serv_addr,
-				    serv_addr_sz);
-}
-
 int ktls_set_tls_mode(struct ktls_session *session, const char *mode)
 {
 	if (!session)
@@ -354,37 +128,39 @@ int ktls_set_tls_mode(struct ktls_session *session, const char *mode)
 	else if (!strcmp("tls_12_256_gcm", mode))
 		session->tls_mode = KTLS_TLS_12_256_GCM;
 	else {
-		error("unknown tls mode: %s", mode);
+		fprintf(stderr, "unknown tls mode: %s", mode);
 		return EXIT_FAILURE;
 	}
 	return EXIT_SUCCESS;
 }
 
-#define INIT_GCM_WITH_MODE(V, X)                                               \
-	{                                                                      \
-		struct tls12_crypto_info_aes_gcm_##X crypto_info;              \
-\
-		crypto_info.info.version = TLS_##V##_VERSION;                  \
-		crypto_info.info.cipher_type = TLS_CIPHER_AES_GCM_##X;         \
-		memcpy(crypto_info.iv, seq_number,                             \
-		       TLS_CIPHER_AES_GCM_##X##_IV_SIZE);                      \
-		memcpy(crypto_info.rec_seq, seq_number,                        \
-		       TLS_CIPHER_AES_GCM_##X##_REC_SEQ_SIZE);                 \
-		if (cipher_key.size != TLS_CIPHER_AES_GCM_##X##_KEY_SIZE) {    \
-			error("mismatch in send key size: %d != %d\n",         \
-			      cipher_key.size,                                 \
-			      TLS_CIPHER_AES_GCM_##X##_KEY_SIZE);              \
-			goto cleanup;                                          \
-		}                                                              \
-		memcpy(crypto_info.key, cipher_key.data,                       \
-		       TLS_CIPHER_AES_GCM_##X##_KEY_SIZE);                     \
-		memcpy(crypto_info.salt, iv.data,                              \
-		       TLS_CIPHER_AES_GCM_##X##_SALT_SIZE);                    \
-		if (setsockopt(sock, SOL_TLS, is_sender ? TLS_TX : TLS_RX,     \
-			       &crypto_info, sizeof(crypto_info))) {           \
-			error("fail to set kernel tls: %s", strerror(errno));  \
-			goto cleanup;                                          \
-		}                                                              \
+#define INIT_GCM_WITH_MODE(V, X)					\
+	{								\
+		struct tls12_crypto_info_aes_gcm_##X crypto_info;	\
+									\
+		crypto_info.info.version = TLS_##V##_VERSION;		\
+		crypto_info.info.cipher_type = TLS_CIPHER_AES_GCM_##X;	\
+		memcpy(crypto_info.iv, seq_number,			\
+		       TLS_CIPHER_AES_GCM_##X##_IV_SIZE);		\
+		memcpy(crypto_info.rec_seq, seq_number,			\
+		       TLS_CIPHER_AES_GCM_##X##_REC_SEQ_SIZE);		\
+		if (cipher_key.size != TLS_CIPHER_AES_GCM_##X##_KEY_SIZE) { \
+			fprintf(stderr,					\
+				"mismatch in send key size: %d != %d\n", \
+				cipher_key.size,			\
+				TLS_CIPHER_AES_GCM_##X##_KEY_SIZE);	\
+			goto cleanup;					\
+		}							\
+		memcpy(crypto_info.key, cipher_key.data,		\
+		       TLS_CIPHER_AES_GCM_##X##_KEY_SIZE);		\
+		memcpy(crypto_info.salt, iv.data,			\
+		       TLS_CIPHER_AES_GCM_##X##_SALT_SIZE);		\
+		if (setsockopt(sock, SOL_TLS, is_sender ? TLS_TX : TLS_RX, \
+			       &crypto_info, sizeof(crypto_info))) {	\
+			fprintf(stderr, "fail to set kernel tls: %s",	\
+				strerror(errno));			\
+			goto cleanup;					\
+		}							\
 	}
 
 int ktls_handshake_tls(struct ktls_session *session, int sock)
@@ -411,7 +187,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 		rc = gnutls_credentials_set(session->session, GNUTLS_CRD_PSK,
 					    session->psk_cred_client);
 		if (rc != GNUTLS_E_SUCCESS) {
-			error("fail to set PSK for client: %s",
+			fprintf(stderr, "fail to set PSK for client: %s",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
@@ -421,7 +197,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 		rc = gnutls_credentials_set(session->session, GNUTLS_CRD_PSK,
 					    session->psk_cred_server);
 		if (rc != GNUTLS_E_SUCCESS) {
-			error("fail to set PSK for server: %s",
+			fprintf(stderr, "fail to set PSK for server: %s",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
@@ -433,14 +209,14 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 					    session->crt_cred);
 
 		if (rc == GNUTLS_E_SUCCESS) {
-			error("fail to set certificate: %s",
+			fprintf(stderr, "fail to set certificate: %s",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
 	}
 
 	if (setsockopt(sock, SOL_TCP, TCP_ULP, "tls", sizeof("tls"))) {
-		error("fail to set kernel TLS on socket: %s", strerror(errno));
+		fprintf(stderr, "fail to set kernel TLS on socket: %s", strerror(errno));
 		goto cleanup;
 	}
 
@@ -464,7 +240,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 	rc = gnutls_priority_set_direct(session->session, tls_priority_list,
 					NULL);
 	if (rc != GNUTLS_E_SUCCESS) {
-		error("fail to set priority: %s", gnutls_strerror(rc));
+		fprintf(stderr, "fail to set priority: %s", gnutls_strerror(rc));
 		goto cleanup;
 	}
 
@@ -475,7 +251,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 
 	do {
 		if (handshake_retry < 0) {
-			error("exhaust retries on handshake");
+			fprintf(stderr, "exhaust retries on handshake");
 			break;
 		}
 		rc = gnutls_handshake(session->session);
@@ -483,10 +259,10 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 	} while (rc < 0 && !gnutls_error_is_fatal(rc));
 
 	if (gnutls_error_is_fatal(rc)) {
-		error("fail on handshake: %s", gnutls_strerror(rc));
+		fprintf(stderr, "fail on handshake: %s", gnutls_strerror(rc));
 		goto cleanup;
 	}
-	if (bconf.verbose > 0) {
+	if (ktls_verbose > 0) {
 		char *desc = gnutls_session_get_desc(session->session);
 
 		printf("TLS session info: %s\n", desc);
@@ -498,7 +274,7 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 	rc = gnutls_record_get_state(session->session, is_sender ? 0 : 1,
 				     &mac_key, &iv, &cipher_key, seq_number);
 	if (rc != GNUTLS_E_SUCCESS) {
-		error("fail on retrieve TLS record: %s", gnutls_strerror(rc));
+		fprintf(stderr, "fail on retrieve TLS record: %s", gnutls_strerror(rc));
 		goto cleanup;
 	}
 
@@ -514,25 +290,13 @@ int ktls_handshake_tls(struct ktls_session *session, int sock)
 		break;
 	}
 
-	if (bconf.verbose > 0)
+	if (ktls_verbose > 0)
 		fprintf(stderr, "ktls init done\n");
 
 	return EXIT_SUCCESS;
 
 cleanup:
 	return EXIT_FAILURE;
-}
-
-static int ktls_cp_datum(gnutls_datum_t *to, const gnutls_datum_t *from)
-{
-	if (!to || !from)
-		return EXIT_FAILURE;
-
-	to->size = from->size;
-	to->data = (unsigned char *)gnutls_malloc(to->size);
-	memmove(to->data, from->data, to->size);
-
-	return EXIT_SUCCESS;
 }
 
 static int ktls_cmp_datum(const gnutls_datum_t *lhs, const gnutls_datum_t *rhs)
@@ -549,46 +313,96 @@ static int ktls_cmp_datum(const gnutls_datum_t *lhs, const gnutls_datum_t *rhs)
 	return memcmp(lhs->data, rhs->data, lhs->size);
 }
 
-static int ktls_set_datum(gnutls_datum_t *to, const unsigned char *from,
-			  int from_size)
-{
-	if (!to || !from || !from_size)
-		return EXIT_FAILURE;
-
-	if (from_size < 0)
-		from_size = strlen((const char *)from);
-
-	to->size = from_size;
-	to->data = (unsigned char *)gnutls_malloc(to->size);
-	memmove(to->data, from, from_size);
-
-	return EXIT_SUCCESS;
-}
-
 static int tls_psk_client_callback(gnutls_session_t session,
-				   gnutls_datum_t *username,
+				   char **username,
 				   gnutls_datum_t *key)
 {
-	if (ktls_cp_datum(username, &ktls_psk_username) ||
-	    ktls_cp_datum(key, &ktls_psk_key))
-		return EXIT_FAILURE;
+	char *tmp_id, *ptr;
+	void *tmp_data;
+	int ret;
 
+	if (ktls_client_key_num >= ktls_key_num) {
+		fprintf(stderr, "Invalid client key number %d\n",
+			ktls_client_key_num);
+		return EXIT_FAILURE;
+	}
+	fprintf(stdout, "Checking client id %d\n", ktls_client_key_num);
+	ret = keyctl_describe_alloc(ktls_key_list[ktls_client_key_num],
+				    &tmp_id);
+	if (ret <= 0) {
+		fprintf(stderr, "Failed to describe client key %d\n",
+			ktls_client_key_num);
+		goto out_failure;
+	}
+	ptr = strrchr(tmp_id, ';');
+	if (!ptr) {
+		fprintf(stderr, "Invalid key identity %s\n", tmp_id);
+		goto out_free_id;
+	}
+	*username = malloc(strlen(ptr) + 1);
+	if (!username) {
+		fprintf(stderr, "Failed to allocate identity\n");
+		goto out_free_id;
+	}
+	strcpy(*username, ptr);
+	free(tmp_id);
+	ret = keyctl_read_alloc(ktls_key_list[ktls_client_key_num],
+				&tmp_data);
+	if (ret <= 0) {
+		fprintf(stderr, "Failed to read client key %d\n",
+			ktls_client_key_num);
+		goto out_failure;
+	}
+	key->data = tmp_data;
+	key->size = ret;
 	return EXIT_SUCCESS;
+out_free_id:
+	free(tmp_id);
+out_failure:
+	ktls_client_key_num++;
+	return EXIT_FAILURE;
 }
 
 static int tls_psk_server_callback(gnutls_session_t session,
-				   const gnutls_datum_t *username,
+				   const char *username,
 				   gnutls_datum_t *key)
 {
-	if (ktls_cmp_datum(username, &ktls_psk_username) ||
-	    ktls_cp_datum(key, &ktls_psk_key))
-		return EXIT_FAILURE;
+	int i;
 
-	return EXIT_SUCCESS;
+	fprintf(stdout, "Checking server id %s\n", username);
+	for (i = 0; i < ktls_key_num; i++) {
+		char *tmp_id, *ptr;
+		void *tmp_data;
+		gnutls_datum_t tmp_psk;
+		int ret;
+
+		ret = keyctl_describe_alloc(ktls_key_list[i],
+					    &tmp_id);
+		if (ret <= 0)
+			continue;
+		ptr = strrchr(tmp_id, ';');
+		if (!ptr || strcmp(ptr, username)) {
+			free(tmp_id);
+			fprintf(stderr, "Non-matching username %s\n", tmp_id);
+			continue;
+		}
+		free(tmp_id);
+		ret = keyctl_read_alloc(ktls_key_list[i], &tmp_data);
+		if (ret <= 0)
+			continue;
+		tmp_psk.data = tmp_data;
+		tmp_psk.size = ret;
+		if (!ktls_cmp_datum(key, &tmp_psk)) {
+			free(tmp_psk.data);
+			return EXIT_SUCCESS;
+		}
+		free(tmp_psk.data);
+	}
+	
+	return EXIT_FAILURE;
 }
 
-int ktls_set_psk_session(struct ktls_session *session, const char *username,
-			 const unsigned char *passwd, const size_t sz_passwd)
+int ktls_set_psk_session(struct ktls_session *session)
 {
 	bool is_sender = false;
 	int rc = 0;
@@ -602,11 +416,11 @@ int ktls_set_psk_session(struct ktls_session *session, const char *username,
 		rc = gnutls_psk_allocate_server_credentials(
 			&session->psk_cred_server);
 		if (rc != GNUTLS_E_SUCCESS) {
-			error("fail on set psk for server: %s",
+			fprintf(stderr, "fail on set psk for server: %s",
 			      gnutls_strerror(rc));
 			goto cleanup;
 		}
-		gnutls_psk_set_server_credentials_function2(
+		gnutls_psk_set_server_credentials_function(
 			session->psk_cred_server, tls_psk_server_callback);
 	}
 
@@ -614,66 +428,17 @@ int ktls_set_psk_session(struct ktls_session *session, const char *username,
 		rc = gnutls_psk_allocate_client_credentials(
 			&session->psk_cred_client);
 		if (rc != GNUTLS_E_SUCCESS) {
-			error("fail on set psk for client: %s",
-			      gnutls_strerror(rc));
+			fprintf(stderr, "fail on set psk for client: %s",
+				gnutls_strerror(rc));
 			goto cleanup;
 		}
-		gnutls_psk_set_client_credentials_function2(
+		gnutls_psk_set_client_credentials_function(
 			session->psk_cred_client, tls_psk_client_callback);
+		ktls_client_key_num = 0;
 	}
-
-	if (!ktls_psk_key.size)
-		gnutls_free(ktls_psk_key.data);
-
-	if (!ktls_psk_username.size)
-		gnutls_free(ktls_psk_username.data);
-
-	if (ktls_set_datum(&ktls_psk_username, (const unsigned char *)username,
-			   -1) ||
-	    ktls_set_datum(&ktls_psk_key, passwd, sz_passwd))
-		goto cleanup;
 
 	return EXIT_SUCCESS;
 
 cleanup:
 	return EXIT_FAILURE;
-}
-
-int ktls_create_sock_oneshot(struct ktls_session *session, const char *host,
-			     const char *port)
-{
-	int sock = 0;
-	int nport = 0;
-	bool is_sender;
-
-	if (!session || !session->session)
-		return EXIT_FAILURE;
-
-	is_sender = session->role == GNUTLS_CLIENT;
-
-	nport = atoi(port);
-
-	if (nport >= 0 && nport <= 65535)
-		nport = htons((uint16_t)nport);
-
-	if (ktls_connect_ip(&sock, is_sender, host, (uint16_t)nport))
-		if (ktls_connect_domain(&sock, is_sender, host, nport))
-			goto cleanup;
-
-	if (!is_sender) {
-		int accepted_sock = KTLS_INVALID_FD;
-
-		accepted_sock = accept(sock, (struct sockaddr *)NULL, NULL);
-		close(sock);
-		sock = accepted_sock;
-	}
-
-	if (ktls_handshake_tls(session, sock))
-		goto cleanup;
-
-	return sock;
-
-cleanup:
-	close(sock);
-	return KTLS_INVALID_FD;
 }

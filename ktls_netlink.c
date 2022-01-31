@@ -32,12 +32,19 @@
 
 #include <keyutils.h>
 
+#include "ktls.h"
+
+key_serial_t *ktls_key_list;
+int ktls_key_num;
+
 #define NETLINK_TLS 24
 
 #define TLS_NL_MAGIC 0x544C
 #define TLS_NL_VERSION 0x01
 #define TLS_NL_CLIENT_MODE 0x00
 #define TLS_NL_SERVER_MODE 0x01
+
+int ktls_verbose = 0;
 
 struct tls_nl_msg {
 	u_int16_t magic;
@@ -79,8 +86,10 @@ int main(int argc, char *argv[])
 
 	while (1) {
 		static unsigned char buffer[512];
-		static struct nlmsghdr *nhdr;
-		static struct tls_nl_msg *tls_msg;
+		struct nlmsghdr *nhdr;
+		struct tls_nl_msg *tls_msg;
+		struct ktls_session *session;
+		bool is_server = false;
 		ssize_t buflen;
 		int i;
 
@@ -131,6 +140,36 @@ int main(int argc, char *argv[])
 			fprintf(stdout, "Key identity: %s\n", key_id);
 			free(key_id);
 		}
+		if (tls_msg->fd < 0) {
+			fprintf(stdout, "No tls filedescriptor\n");
+			continue;
+		}
+		ktls_key_list = malloc(tls_msg->key_num * sizeof(key_serial_t));
+		if (!ktls_key_list) {
+			fprintf(stderr, "Failed to allocate ktls key list\n");
+			goto close_and_continue;
+		}
+		memcpy(ktls_key_list, tls_msg->key_serial,
+		       tls_msg->key_num * sizeof(key_serial_t));
+		ktls_key_num = tls_msg->key_num;
+		is_server = tls_msg->mode == TLS_NL_SERVER_MODE;
+		session = ktls_create_session(is_server);
+		if (!session) {
+			fprintf(stderr, "Failed to create ktls session\n");
+			goto free_and_continue;
+		}
+		if (ktls_set_psk_session(session))
+			goto destroy_and_continue;
+
+		ktls_handshake_tls(session, tls_msg->fd);
+	destroy_and_continue:
+		ktls_destroy_session(session);
+	free_and_continue:
+		free(ktls_key_list);
+		ktls_key_list = NULL;
+		ktls_key_num = 0;
+	close_and_continue:
+		close(tls_msg->fd);
 	}
 
 exit:
